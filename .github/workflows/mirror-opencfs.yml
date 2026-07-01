@@ -24,6 +24,20 @@ jobs:
         run: git push --mirror "https://x:${{ secrets.OPENCFS_MIRROR_TOKEN }}@github.com/${{ env.TARGET_REPO }}.git"
 
       # -------------------------------------------------------------------
+      # 1b. Mirror the wiki from GitLab to GitHub.
+      #     The wiki is a separate bare git repo at <project>.wiki.git.
+      #     Requires the GitHub wiki to be enabled and initialised with at
+      #     least one page before the first push (Settings -> Features ->
+      #     Wikis, then create a dummy page via the Wiki tab).
+      # -------------------------------------------------------------------
+      - name: Clone wiki from GitLab
+        run: git clone --bare https://gitlab.com/openCFS/cfs.wiki.git wiki.git
+
+      - name: Push wiki mirror to GitHub
+        working-directory: wiki.git
+        run: git push --mirror "https://x:${{ secrets.OPENCFS_MIRROR_TOKEN }}@github.com/${{ env.TARGET_REPO }}.wiki.git"
+
+      # -------------------------------------------------------------------
       # 2. Fix default branch (push --mirror overwrites HEAD each time)
       # -------------------------------------------------------------------
       - name: Set default branch to master
