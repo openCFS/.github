@@ -33,6 +33,62 @@ jobs:
       - name: Clone wiki from GitLab
         run: git clone --bare https://gitlab.com/openCFS/cfs.wiki.git wiki.git
 
+      - name: Rewrite GitLab URLs to GitHub URLs in wiki
+        run: |
+          # Convert bare repo to a normal checkout so we can edit files,
+          # rewrite the URLs, commit, then push back into the bare repo.
+          git clone wiki.git wiki-rewrite
+          cd wiki-rewrite
+
+          # Rule 1: file links  /-/blob/ -> /blob/
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs/-/blob/|https://github.com/openCFS/cfs/blob/|g'
+
+          # Rule 2: folder/tree links  /-/tree/ -> /tree/
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs/-/tree/|https://github.com/openCFS/cfs/tree/|g'
+
+          # Rule 3: wiki links  /-/wikis/<page> -> /wiki/<page>
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs/-/wikis/|https://github.com/openCFS/cfs/wiki/|g'
+
+          # Rule 4: bare clone URL
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs.git|https://github.com/openCFS/cfs.git|g'
+
+          # Rule 5: bare repo root URL (only when followed by non-alpha, i.e. not part of a longer path)
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs\([^a-zA-Z/]\)|https://github.com/openCFS/cfs\1|g'
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs$|https://github.com/openCFS/cfs|g'
+
+          # Rule 6: old uppercase CFS repo name
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/CFS.git|https://github.com/openCFS/cfs.git|g'
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/CFS\([^a-zA-Z/]\)|https://github.com/openCFS/cfs\1|g'
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/CFS$|https://github.com/openCFS/cfs|g'
+
+          # Rule 7: strip GitLab-specific ?ref_type=heads query parameter
+          find . -name "*.md" | xargs sed -i 's|?ref_type=heads||g'
+
+          # Commit if anything changed
+          if git diff --quiet; then
+            echo "No URLs needed rewriting."
+          else
+            echo "Rewrote the following files:"
+            git diff --name-only
+            git config user.email "mirror-bot@github-actions"
+            git config user.name "Mirror Bot"
+            git add -A
+            git commit -m "chore: rewrite GitLab URLs to GitHub equivalents for mirrored copy"
+            git push
+          fi
+          # Note: the following are intentionally left unchanged:
+          #   gitlab.com/openCFS/Testsuite        - private, cannot mirror
+          #   gitlab.com/openCFS/build-environment - private, cannot mirror
+          #   gitlab.com/openCFS/cfs/-/pipelines  - GitLab CI, no GitHub equivalent
+          #   gitlab.com/openCFS/cfs/-/issues     - issue tracker, stays on GitLab
+          #   gitlab.com/openCFS/cfs/-/jobs       - CI jobs, stays on GitLab
+          #   gitlab.com/openCFS/cfs/-/packages   - package registry, stays on GitLab
+          #   gitlab.com/openCFS/cfs/-/forks      - GitLab-specific
+          #   gitlab.com/groups/openCFS/-/wikis   - group-level wiki, separate
+          #   gitlab.com/mmzakhar/oneapi-ci       - third-party repo
+          #   gitlab.com/help/...                 - GitLab docs
+          #   gitlab.com/gitlab-org/...           - GitLab platform
+
       - name: Push wiki mirror to GitHub
         working-directory: wiki.git
         run: git push --mirror "https://x:${{ secrets.OPENCFS_MIRROR_TOKEN }}@github.com/${{ env.TARGET_REPO }}.wiki.git"
@@ -55,8 +111,10 @@ jobs:
       #      including drafts (checked via API, not just gh release view).
       #    - Downloads all binary assets dynamically from .assets.links[].
       #    - Source archives are excluded (GitHub generates them from tags).
-      #    - The most recent release gets the "latest" UI label via --latest.
-      #      No git tag called "latest" is ever created.
+      #    - Processes oldest-first so the most recent release is created
+      #      last and keeps the "latest" UI label correctly.
+      #    - After the loop, explicitly sets "latest" label on the most
+      #      recent release to correct any pre-existing misplacement.
       # -------------------------------------------------------------------
       - name: Mirror all releases from GitLab to GitHub
         run: |
@@ -83,7 +141,6 @@ jobs:
           echo "Latest release tag: $LATEST_TAG"
 
           # Fetch all existing GitHub releases (including drafts) once upfront
-          # so we can check existence without an API call per release
           EXISTING=$(curl -s \
             -H "Authorization: token ${{ secrets.OPENCFS_MIRROR_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
@@ -92,7 +149,8 @@ jobs:
 
           echo "Existing GitHub releases: $(echo "$EXISTING" | tr '\n' ' ')"
 
-          # Process each release
+          # Process oldest-first so the most recent release is created last
+          # and keeps the --latest label correctly
           echo "$ALL_RELEASES" | jq -c 'reverse | .[]' | while read -r release; do
             TAG=$(echo "$release"  | jq -r '.tag_name')
             NAME=$(echo "$release" | jq -r '.name')
@@ -136,14 +194,13 @@ jobs:
             ASSET_FILES=$(find "assets_${TAG}/" -type f | tr '\n' ' ')
 
             # --latest marks the release as latest in the GitHub UI only.
-            # It does NOT create a git tag. Only applied to the most recent release.
+            # Only applied to the most recent release.
             LATEST_FLAG=""
             if [ "$TAG" = "$LATEST_TAG" ]; then
               LATEST_FLAG="--latest"
             fi
 
-            # --verify-tag ensures we use the existing tag from the mirror
-            # push and never let gh create a new one itself
+            # --verify-tag ensures we use the existing tag from the mirror push
             if [ -z "$ASSET_FILES" ]; then
               gh release create "$TAG" \
                 --repo ${{ env.TARGET_REPO }} \
