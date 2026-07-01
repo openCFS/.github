@@ -37,10 +37,12 @@ jobs:
       # -------------------------------------------------------------------
       # 3. Mirror all GitLab releases to GitHub.
       #    - Fetches all releases from GitLab (paginated).
-      #    - Skips releases that already exist on GitHub (idempotent).
+      #    - Skips releases that already exist on GitHub (idempotent),
+      #      including drafts (checked via API, not just gh release view).
       #    - Downloads all binary assets dynamically from .assets.links[].
       #    - Source archives are excluded (GitHub generates them from tags).
-      #    - The most recent release (.[0] from GitLab API) is tagged "latest".
+      #    - The most recent release gets the "latest" UI label via --latest.
+      #      No git tag called "latest" is ever created.
       # -------------------------------------------------------------------
       - name: Mirror all releases from GitLab to GitHub
         run: |
@@ -66,6 +68,16 @@ jobs:
           LATEST_TAG=$(echo "$ALL_RELEASES" | jq -r '.[0].tag_name')
           echo "Latest release tag: $LATEST_TAG"
 
+          # Fetch all existing GitHub releases (including drafts) once upfront
+          # so we can check existence without an API call per release
+          EXISTING=$(curl -s \
+            -H "Authorization: token ${{ secrets.OPENCFS_MIRROR_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ env.TARGET_REPO }}/releases?per_page=100" \
+            | jq -r '.[].tag_name')
+
+          echo "Existing GitHub releases: $(echo "$EXISTING" | tr '\n' ' ')"
+
           # Process each release
           echo "$ALL_RELEASES" | jq -c '.[]' | while read -r release; do
             TAG=$(echo "$release"  | jq -r '.tag_name')
@@ -75,8 +87,8 @@ jobs:
             echo ""
             echo "==> Processing release: $TAG ($NAME)"
 
-            # Skip if this release already exists on GitHub
-            if gh release view "$TAG" --repo ${{ env.TARGET_REPO }} > /dev/null 2>&1; then
+            # Skip if this release already exists on GitHub (published or draft)
+            if echo "$EXISTING" | grep -qx "$TAG"; then
               echo "    Already exists on GitHub, skipping."
               continue
             fi
@@ -106,26 +118,31 @@ jobs:
             # Write release notes to a temp file
             echo "$DESC" > "notes_${TAG}.md"
 
-            # Build the gh release create command
+            # Build asset file list
             ASSET_FILES=$(find "assets_${TAG}/" -type f | tr '\n' ' ')
 
-            # Mark as latest only if this is the most recent release
+            # --latest marks the release as latest in the GitHub UI only.
+            # It does NOT create a git tag. Only applied to the most recent release.
             LATEST_FLAG=""
             if [ "$TAG" = "$LATEST_TAG" ]; then
               LATEST_FLAG="--latest"
             fi
 
+            # --verify-tag ensures we use the existing tag from the mirror
+            # push and never let gh create a new one itself
             if [ -z "$ASSET_FILES" ]; then
               gh release create "$TAG" \
                 --repo ${{ env.TARGET_REPO }} \
                 --title "$NAME" \
                 --notes-file "notes_${TAG}.md" \
+                --verify-tag \
                 $LATEST_FLAG
             else
               gh release create "$TAG" \
                 --repo ${{ env.TARGET_REPO }} \
                 --title "$NAME" \
                 --notes-file "notes_${TAG}.md" \
+                --verify-tag \
                 $LATEST_FLAG \
                 $ASSET_FILES
             fi
