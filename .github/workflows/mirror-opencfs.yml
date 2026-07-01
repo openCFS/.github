@@ -35,101 +35,106 @@ jobs:
             -d '{"default_branch":"master"}'
 
       # -------------------------------------------------------------------
-      # 3. Fetch latest release metadata from GitLab.
-      #    Uses the releases list API (?per_page=1) sorted by released_at
-      #    descending (default), so .[0] is always the most recent release
-      #    regardless of whether it is explicitly marked "latest" on GitLab.
+      # 3. Mirror all GitLab releases to GitHub.
+      #    - Fetches all releases from GitLab (paginated).
+      #    - Skips releases that already exist on GitHub (idempotent).
+      #    - Downloads all binary assets dynamically from .assets.links[].
+      #    - Source archives are excluded (GitHub generates them from tags).
+      #    - The most recent release (.[0] from GitLab API) is tagged "latest".
       # -------------------------------------------------------------------
-      - name: Get latest GitLab release
-        id: gitlab_release
+      - name: Mirror all releases from GitLab to GitHub
         run: |
-          RELEASE=$(curl -s \
-            "https://gitlab.com/api/v4/projects/${{ env.GITLAB_PROJECT_ID }}/releases?per_page=1" \
-            | jq -r '.[0]')
+          PAGE=1
+          ALL_RELEASES="[]"
 
-          TAG=$(echo "$RELEASE" | jq -r '.tag_name')
-          NAME=$(echo "$RELEASE" | jq -r '.name')
-          DESC=$(echo "$RELEASE" | jq -r '.description')
+          # Paginate through all GitLab releases
+          while true; do
+            BATCH=$(curl -s \
+              "https://gitlab.com/api/v4/projects/${{ env.GITLAB_PROJECT_ID }}/releases?per_page=100&page=${PAGE}")
+            COUNT=$(echo "$BATCH" | jq 'length')
+            if [ "$COUNT" -eq 0 ]; then
+              break
+            fi
+            ALL_RELEASES=$(echo "$ALL_RELEASES $BATCH" | jq -s '.[0] + .[1]')
+            PAGE=$((PAGE + 1))
+          done
 
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "name=$NAME" >> $GITHUB_OUTPUT
+          TOTAL=$(echo "$ALL_RELEASES" | jq 'length')
+          echo "Found $TOTAL releases on GitLab."
 
-          # Write description to a file to preserve newlines safely
-          echo "$DESC" > release_notes.md
+          # The first entry is the most recent (API default: released_at desc)
+          LATEST_TAG=$(echo "$ALL_RELEASES" | jq -r '.[0].tag_name')
+          echo "Latest release tag: $LATEST_TAG"
 
-          echo "Found latest GitLab release: $TAG ($NAME)"
+          # Process each release
+          echo "$ALL_RELEASES" | jq -c '.[]' | while read -r release; do
+            TAG=$(echo "$release"  | jq -r '.tag_name')
+            NAME=$(echo "$release" | jq -r '.name')
+            DESC=$(echo "$release" | jq -r '.description')
 
-      # -------------------------------------------------------------------
-      # 4. Download binary assets from the latest GitLab release.
-      #    Asset URLs and filenames are read dynamically from the API
-      #    via .assets.links[], so no hardcoded filenames are needed.
-      #    Source archives (zip, tar.gz, etc.) are excluded — GitLab lists
-      #    those under .assets.sources, not .assets.links, and GitHub
-      #    generates them automatically from the tag anyway.
-      # -------------------------------------------------------------------
-      - name: Download release assets from GitLab
-        run: |
-          mkdir -p assets
+            echo ""
+            echo "==> Processing release: $TAG ($NAME)"
 
-          RELEASE=$(curl -s \
-            "https://gitlab.com/api/v4/projects/${{ env.GITLAB_PROJECT_ID }}/releases?per_page=1" \
-            | jq -r '.[0]')
+            # Skip if this release already exists on GitHub
+            if gh release view "$TAG" --repo ${{ env.TARGET_REPO }} > /dev/null 2>&1; then
+              echo "    Already exists on GitHub, skipping."
+              continue
+            fi
 
-          LINK_COUNT=$(echo "$RELEASE" | jq '.assets.links | length')
+            # Download binary assets (links only, not auto-generated sources)
+            mkdir -p "assets_${TAG}"
+            LINK_COUNT=$(echo "$release" | jq '.assets.links | length')
 
-          if [ "$LINK_COUNT" -eq 0 ]; then
-            echo "No binary assets found on the GitLab release, skipping download."
-          else
-            echo "$RELEASE" | jq -c '.assets.links[]' | while read -r link; do
-              NAME=$(echo "$link" | jq -r '.name')
-              URL=$(echo "$link"  | jq -r '.direct_asset_url // .url')
-              # Derive filename from the URL path, stripping query strings
-              FILENAME=$(basename "$(echo "$URL" | cut -d'?' -f1)")
-              echo "Downloading: $NAME -> $FILENAME"
-              HTTP_CODE=$(curl -L -o "assets/${FILENAME}" -w "%{http_code}" "$URL")
-              if [ "$HTTP_CODE" != "200" ]; then
-                echo "  -> HTTP $HTTP_CODE, skipping $FILENAME"
-                rm -f "assets/${FILENAME}"
-              else
-                echo "  -> saved ($(du -h "assets/${FILENAME}" | cut -f1))"
-              fi
-            done
-          fi
+            if [ "$LINK_COUNT" -gt 0 ]; then
+              echo "$release" | jq -c '.assets.links[]' | while read -r link; do
+                ASSET_NAME=$(echo "$link" | jq -r '.name')
+                URL=$(echo "$link"        | jq -r '.direct_asset_url // .url')
+                FILENAME=$(basename "$(echo "$URL" | cut -d'?' -f1)")
+                echo "    Downloading: $ASSET_NAME -> $FILENAME"
+                HTTP_CODE=$(curl -L -o "assets_${TAG}/${FILENAME}" -w "%{http_code}" "$URL")
+                if [ "$HTTP_CODE" != "200" ]; then
+                  echo "    -> HTTP $HTTP_CODE, skipping $FILENAME"
+                  rm -f "assets_${TAG}/${FILENAME}"
+                else
+                  echo "    -> saved ($(du -h "assets_${TAG}/${FILENAME}" | cut -f1))"
+                fi
+              done
+            else
+              echo "    No binary assets found for this release."
+            fi
 
-          echo "Assets downloaded:"
-          ls -lh assets/ || echo "(none)"
+            # Write release notes to a temp file
+            echo "$DESC" > "notes_${TAG}.md"
 
-      # -------------------------------------------------------------------
-      # 5. Delete existing 'latest' GitHub release (if any) and recreate it
-      #    gh CLI is pre-installed on ubuntu-latest runners
-      # -------------------------------------------------------------------
-      - name: Delete existing 'latest' release on GitHub if present
-        run: |
-          gh release delete latest \
-            --repo ${{ env.TARGET_REPO }} \
-            --yes \
-            --cleanup-tag \
-          || echo "No existing 'latest' release to delete, continuing."
+            # Build the gh release create command
+            ASSET_FILES=$(find "assets_${TAG}/" -type f | tr '\n' ' ')
 
-      - name: Create new 'latest' release on GitHub with assets
-        run: |
-          ASSET_FILES=$(find assets/ -type f | tr '\n' ' ')
+            # Mark as latest only if this is the most recent release
+            LATEST_FLAG=""
+            if [ "$TAG" = "$LATEST_TAG" ]; then
+              LATEST_FLAG="--latest"
+            fi
 
-          if [ -z "$ASSET_FILES" ]; then
-            # No binary assets — create release without files
-            gh release create latest \
-              --repo ${{ env.TARGET_REPO }} \
-              --title "${{ steps.gitlab_release.outputs.name }}" \
-              --notes-file release_notes.md \
-              --latest
-          else
-            gh release create latest \
-              --repo ${{ env.TARGET_REPO }} \
-              --title "${{ steps.gitlab_release.outputs.name }}" \
-              --notes-file release_notes.md \
-              --latest \
-              $ASSET_FILES
-          fi
+            if [ -z "$ASSET_FILES" ]; then
+              gh release create "$TAG" \
+                --repo ${{ env.TARGET_REPO }} \
+                --title "$NAME" \
+                --notes-file "notes_${TAG}.md" \
+                $LATEST_FLAG
+            else
+              gh release create "$TAG" \
+                --repo ${{ env.TARGET_REPO }} \
+                --title "$NAME" \
+                --notes-file "notes_${TAG}.md" \
+                $LATEST_FLAG \
+                $ASSET_FILES
+            fi
 
-          echo "Release 'latest' created successfully."
-          echo "Mirrored from GitLab tag: ${{ steps.gitlab_release.outputs.tag }}"
+            echo "    Release $TAG created on GitHub."
+
+            # Clean up temp files for this release
+            rm -rf "assets_${TAG}" "notes_${TAG}.md"
+          done
+
+          echo ""
+          echo "==> All releases mirrored. Latest: $LATEST_TAG"
