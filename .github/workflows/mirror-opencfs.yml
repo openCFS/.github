@@ -79,7 +79,7 @@ jobs:
           echo "Existing GitHub releases: $(echo "$EXISTING" | tr '\n' ' ')"
 
           # Process each release
-          echo "$ALL_RELEASES" | jq -c '.[]' | while read -r release; do
+          echo "$ALL_RELEASES" | jq -c 'reverse | .[]' | while read -r release; do
             TAG=$(echo "$release"  | jq -r '.tag_name')
             NAME=$(echo "$release" | jq -r '.name')
             DESC=$(echo "$release" | jq -r '.description')
@@ -152,6 +152,13 @@ jobs:
             # Clean up temp files for this release
             rm -rf "assets_${TAG}" "notes_${TAG}.md"
           done
+
+          # Ensure the latest label is always on the correct release,
+          # even if it already existed and was skipped in the loop above.
+          echo "==> Ensuring 'latest' label is on $LATEST_TAG..."
+          gh release edit "$LATEST_TAG" \
+            --repo ${{ env.TARGET_REPO }} \
+            --latest
 
           echo ""
           echo "==> All releases mirrored. Latest: $LATEST_TAG"
