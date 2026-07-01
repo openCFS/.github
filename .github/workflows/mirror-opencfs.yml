@@ -1,0 +1,121 @@
+name: Mirror openCFS from GitLab
+
+on:
+  schedule:
+    - cron: '0 3 * * *'   # runs daily at 3am UTC
+  workflow_dispatch:        # allows manual trigger from the GitHub UI
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.OPENCFS_MIRROR_TOKEN }}
+      GITLAB_PROJECT_ID: "openCFS%2Fcfs"   # URL-encoded namespace/project
+      TARGET_REPO: "openCFS/cfs"          # <-- replace with your org/repo
+
+    steps:
+      # -------------------------------------------------------------------
+      # 1. Mirror all branches and tags from GitLab to GitHub
+      # -------------------------------------------------------------------
+      - name: Clone from GitLab
+        run: git clone --bare https://gitlab.com/openCFS/cfs.git .
+
+      - name: Push mirror to GitHub
+        run: git push --mirror "https://x:${{ secrets.OPENCFS_MIRROR_TOKEN }}@github.com/${{ env.TARGET_REPO }}.git"
+
+      # -------------------------------------------------------------------
+      # 2. Fix default branch (push --mirror overwrites HEAD each time)
+      # -------------------------------------------------------------------
+      - name: Set default branch to master
+        run: |
+          curl -s -X PATCH \
+            -H "Authorization: token ${{ secrets.OPENCFS_MIRROR_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ env.TARGET_REPO }} \
+            -d '{"default_branch":"master"}'
+
+      # -------------------------------------------------------------------
+      # 3. Fetch latest release metadata from GitLab
+      # -------------------------------------------------------------------
+      - name: Get latest GitLab release
+        id: gitlab_release
+        run: |
+          RELEASE=$(curl -s \
+            "https://gitlab.com/api/v4/projects/${{ env.GITLAB_PROJECT_ID }}/releases/permalink/latest")
+
+          TAG=$(echo "$RELEASE" | jq -r '.tag_name')
+          NAME=$(echo "$RELEASE" | jq -r '.name')
+          DESC=$(echo "$RELEASE" | jq -r '.description')
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+
+          # Write description to a file to preserve newlines safely
+          echo "$DESC" > release_notes.md
+
+          echo "Found latest GitLab release: $TAG ($NAME)"
+
+      # -------------------------------------------------------------------
+      # 4. Download all binary assets from the latest GitLab release
+      #    (skips auto-generated source archives which GitHub adds itself)
+      # -------------------------------------------------------------------
+      - name: Download release assets from GitLab
+        run: |
+          mkdir -p assets
+
+          LINKS=$(curl -s \
+            "https://gitlab.com/api/v4/projects/${{ env.GITLAB_PROJECT_ID }}/releases/permalink/latest" \
+            | jq -r '.assets.links[] | "\(.name)|\(.direct_asset_url // .url)"')
+
+          if [ -z "$LINKS" ]; then
+            echo "No asset links found on the GitLab release."
+            exit 0
+          fi
+
+          while IFS='|' read -r name url; do
+            echo "Downloading: $name from $url"
+            # Derive a safe filename from the URL's last path segment
+            filename=$(basename "$(echo "$url" | cut -d'?' -f1)")
+            curl -L -o "assets/$filename" "$url"
+            echo "  -> saved as assets/$filename"
+          done <<< "$LINKS"
+
+          echo "Assets downloaded:"
+          ls -lh assets/
+
+      # -------------------------------------------------------------------
+      # 5. Delete existing 'latest' GitHub release (if any) and recreate it
+      #    gh CLI is pre-installed on ubuntu-latest runners
+      # -------------------------------------------------------------------
+      - name: Delete existing 'latest' release on GitHub if present
+        run: |
+          gh release delete latest \
+            --repo ${{ env.TARGET_REPO }} \
+            --yes \
+            --cleanup-tag \
+          || echo "No existing 'latest' release to delete, continuing."
+ 
+      - name: Create new 'latest' release on GitHub with assets
+        run: |
+          ASSET_FILES=$(find assets/ -type f | tr '\n' ' ')
+ 
+          if [ -z "$ASSET_FILES" ]; then
+            # No binary assets — create release without files
+            gh release create latest \
+              --repo ${{ env.TARGET_REPO }} \
+              --title "${{ steps.gitlab_release.outputs.name }}" \
+              --notes-file release_notes.md \
+              --latest
+          else
+            gh release create latest \
+              --repo ${{ env.TARGET_REPO }} \
+              --title "${{ steps.gitlab_release.outputs.name }}" \
+              --notes-file release_notes.md \
+              --latest \
+              $ASSET_FILES
+          fi
+ 
+          echo "Release 'latest' created successfully."
+          echo "Mirrored from GitLab tag: ${{ steps.gitlab_release.outputs.tag }}"
+ 
+
