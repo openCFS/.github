@@ -11,7 +11,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.OPENCFS_MIRROR_TOKEN }}
       GITLAB_PROJECT_ID: "openCFS%2Fcfs"   # URL-encoded namespace/project
-      TARGET_REPO: "openCFS/cfs"          # <-- replace with your org/repo
+      TARGET_REPO: "openCFS/cfs"           # org/repo on GitHub
 
     steps:
       # -------------------------------------------------------------------
@@ -35,13 +35,17 @@ jobs:
             -d '{"default_branch":"master"}'
 
       # -------------------------------------------------------------------
-      # 3. Fetch latest release metadata from GitLab
+      # 3. Fetch latest release metadata from GitLab.
+      #    Uses the releases list API (?per_page=1) sorted by released_at
+      #    descending (default), so .[0] is always the most recent release
+      #    regardless of whether it is explicitly marked "latest" on GitLab.
       # -------------------------------------------------------------------
       - name: Get latest GitLab release
         id: gitlab_release
         run: |
           RELEASE=$(curl -s \
-            "https://gitlab.com/api/v4/projects/${{ env.GITLAB_PROJECT_ID }}/releases/permalink/latest")
+            "https://gitlab.com/api/v4/projects/${{ env.GITLAB_PROJECT_ID }}/releases?per_page=1" \
+            | jq -r '.[0]')
 
           TAG=$(echo "$RELEASE" | jq -r '.tag_name')
           NAME=$(echo "$RELEASE" | jq -r '.name')
@@ -56,32 +60,44 @@ jobs:
           echo "Found latest GitLab release: $TAG ($NAME)"
 
       # -------------------------------------------------------------------
-      # 4. Download all binary assets from the latest GitLab release
-      #    (skips auto-generated source archives which GitHub adds itself)
+      # 4. Download binary assets from the latest GitLab release.
+      #    Asset URLs and filenames are read dynamically from the API
+      #    via .assets.links[], so no hardcoded filenames are needed.
+      #    Source archives (zip, tar.gz, etc.) are excluded — GitLab lists
+      #    those under .assets.sources, not .assets.links, and GitHub
+      #    generates them automatically from the tag anyway.
       # -------------------------------------------------------------------
       - name: Download release assets from GitLab
         run: |
           mkdir -p assets
 
-          LINKS=$(curl -s \
-            "https://gitlab.com/api/v4/projects/${{ env.GITLAB_PROJECT_ID }}/releases/permalink/latest" \
-            | jq -r '.assets.links[] | "\(.name)|\(.direct_asset_url // .url)"')
+          RELEASE=$(curl -s \
+            "https://gitlab.com/api/v4/projects/${{ env.GITLAB_PROJECT_ID }}/releases?per_page=1" \
+            | jq -r '.[0]')
 
-          if [ -z "$LINKS" ]; then
-            echo "No asset links found on the GitLab release."
-            exit 0
+          LINK_COUNT=$(echo "$RELEASE" | jq '.assets.links | length')
+
+          if [ "$LINK_COUNT" -eq 0 ]; then
+            echo "No binary assets found on the GitLab release, skipping download."
+          else
+            echo "$RELEASE" | jq -c '.assets.links[]' | while read -r link; do
+              NAME=$(echo "$link" | jq -r '.name')
+              URL=$(echo "$link"  | jq -r '.direct_asset_url // .url')
+              # Derive filename from the URL path, stripping query strings
+              FILENAME=$(basename "$(echo "$URL" | cut -d'?' -f1)")
+              echo "Downloading: $NAME -> $FILENAME"
+              HTTP_CODE=$(curl -L -o "assets/${FILENAME}" -w "%{http_code}" "$URL")
+              if [ "$HTTP_CODE" != "200" ]; then
+                echo "  -> HTTP $HTTP_CODE, skipping $FILENAME"
+                rm -f "assets/${FILENAME}"
+              else
+                echo "  -> saved ($(du -h "assets/${FILENAME}" | cut -f1))"
+              fi
+            done
           fi
 
-          while IFS='|' read -r name url; do
-            echo "Downloading: $name from $url"
-            # Derive a safe filename from the URL's last path segment
-            filename=$(basename "$(echo "$url" | cut -d'?' -f1)")
-            curl -L -o "assets/$filename" "$url"
-            echo "  -> saved as assets/$filename"
-          done <<< "$LINKS"
-
           echo "Assets downloaded:"
-          ls -lh assets/
+          ls -lh assets/ || echo "(none)"
 
       # -------------------------------------------------------------------
       # 5. Delete existing 'latest' GitHub release (if any) and recreate it
@@ -94,11 +110,11 @@ jobs:
             --yes \
             --cleanup-tag \
           || echo "No existing 'latest' release to delete, continuing."
- 
+
       - name: Create new 'latest' release on GitHub with assets
         run: |
           ASSET_FILES=$(find assets/ -type f | tr '\n' ' ')
- 
+
           if [ -z "$ASSET_FILES" ]; then
             # No binary assets — create release without files
             gh release create latest \
@@ -114,8 +130,6 @@ jobs:
               --latest \
               $ASSET_FILES
           fi
- 
+
           echo "Release 'latest' created successfully."
           echo "Mirrored from GitLab tag: ${{ steps.gitlab_release.outputs.tag }}"
- 
-
