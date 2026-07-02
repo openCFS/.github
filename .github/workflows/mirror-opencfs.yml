@@ -24,6 +24,41 @@ jobs:
         run: git push --mirror "https://x:${{ secrets.OPENCFS_MIRROR_TOKEN }}@github.com/${{ env.TARGET_REPO }}.git"
 
       # -------------------------------------------------------------------
+      # 1a. Rewrite GitLab URLs to GitHub URLs in the main repo.
+      #     Applies the same sed rules as the wiki rewrite below.
+      #     Covers README.md and all other .md files in the repo.
+      #     The rewritten commit is force-pushed to GitHub only — the
+      #     GitLab repo is never touched.
+      # -------------------------------------------------------------------
+      - name: Rewrite GitLab URLs to GitHub URLs in main repo
+        run: |
+          git clone . repo-rewrite
+          cd repo-rewrite
+
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs/-/blob/|https://github.com/openCFS/cfs/blob/|g'
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs/-/tree/|https://github.com/openCFS/cfs/tree/|g'
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs/-/wikis/|https://github.com/openCFS/cfs/wiki/|g'
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs\.git|https://github.com/openCFS/cfs.git|g'
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs\([^a-zA-Z/]\)|https://github.com/openCFS/cfs\1|g'
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs$|https://github.com/openCFS/cfs|g'
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/CFS\.git|https://github.com/openCFS/cfs.git|g'
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/CFS\([^a-zA-Z/]\)|https://github.com/openCFS/cfs\1|g'
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/CFS$|https://github.com/openCFS/cfs|g'
+          find . -name "*.md" | xargs sed -i 's|?ref_type=heads||g'
+
+          if git diff --quiet; then
+            echo "No URLs needed rewriting in main repo."
+          else
+            echo "Rewrote the following files:"
+            git diff --name-only
+            git config user.email "mirror-bot@github-actions"
+            git config user.name "Mirror Bot"
+            git add -A
+            git commit -m "chore: rewrite GitLab URLs to GitHub equivalents for mirrored copy"
+            git push "https://x:${{ secrets.OPENCFS_MIRROR_TOKEN }}@github.com/${{ env.TARGET_REPO }}.git" HEAD:master --force
+          fi
+
+      # -------------------------------------------------------------------
       # 1b. Mirror the wiki from GitLab to GitHub.
       #     The wiki is a separate bare git repo at <project>.wiki.git.
       #     Requires the GitHub wiki to be enabled and initialised with at
@@ -35,38 +70,22 @@ jobs:
 
       - name: Rewrite GitLab URLs to GitHub URLs in wiki
         run: |
-          # Convert bare repo to a normal checkout so we can edit files,
-          # rewrite the URLs, commit, then push back into the bare repo.
           git clone wiki.git wiki-rewrite
           cd wiki-rewrite
 
-          # Rule 1: file links  /-/blob/ -> /blob/
           find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs/-/blob/|https://github.com/openCFS/cfs/blob/|g'
-
-          # Rule 2: folder/tree links  /-/tree/ -> /tree/
           find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs/-/tree/|https://github.com/openCFS/cfs/tree/|g'
-
-          # Rule 3: wiki links  /-/wikis/<page> -> /wiki/<page>
           find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs/-/wikis/|https://github.com/openCFS/cfs/wiki/|g'
-
-          # Rule 4: bare clone URL
-          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs.git|https://github.com/openCFS/cfs.git|g'
-
-          # Rule 5: bare repo root URL (only when followed by non-alpha, i.e. not part of a longer path)
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs\.git|https://github.com/openCFS/cfs.git|g'
           find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs\([^a-zA-Z/]\)|https://github.com/openCFS/cfs\1|g'
           find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/cfs$|https://github.com/openCFS/cfs|g'
-
-          # Rule 6: old uppercase CFS repo name
-          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/CFS.git|https://github.com/openCFS/cfs.git|g'
+          find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/CFS\.git|https://github.com/openCFS/cfs.git|g'
           find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/CFS\([^a-zA-Z/]\)|https://github.com/openCFS/cfs\1|g'
           find . -name "*.md" | xargs sed -i 's|https://gitlab.com/openCFS/CFS$|https://github.com/openCFS/cfs|g'
-
-          # Rule 7: strip GitLab-specific ?ref_type=heads query parameter
           find . -name "*.md" | xargs sed -i 's|?ref_type=heads||g'
 
-          # Commit if anything changed
           if git diff --quiet; then
-            echo "No URLs needed rewriting."
+            echo "No URLs needed rewriting in wiki."
           else
             echo "Rewrote the following files:"
             git diff --name-only
@@ -121,7 +140,6 @@ jobs:
           PAGE=1
           ALL_RELEASES="[]"
 
-          # Paginate through all GitLab releases
           while true; do
             BATCH=$(curl -s \
               "https://gitlab.com/api/v4/projects/${{ env.GITLAB_PROJECT_ID }}/releases?per_page=100&page=${PAGE}")
@@ -136,11 +154,9 @@ jobs:
           TOTAL=$(echo "$ALL_RELEASES" | jq 'length')
           echo "Found $TOTAL releases on GitLab."
 
-          # The first entry is the most recent (API default: released_at desc)
           LATEST_TAG=$(echo "$ALL_RELEASES" | jq -r '.[0].tag_name')
           echo "Latest release tag: $LATEST_TAG"
 
-          # Fetch all existing GitHub releases (including drafts) once upfront
           EXISTING=$(curl -s \
             -H "Authorization: token ${{ secrets.OPENCFS_MIRROR_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
@@ -149,8 +165,6 @@ jobs:
 
           echo "Existing GitHub releases: $(echo "$EXISTING" | tr '\n' ' ')"
 
-          # Process oldest-first so the most recent release is created last
-          # and keeps the --latest label correctly
           echo "$ALL_RELEASES" | jq -c 'reverse | .[]' | while read -r release; do
             TAG=$(echo "$release"  | jq -r '.tag_name')
             NAME=$(echo "$release" | jq -r '.name')
@@ -159,13 +173,11 @@ jobs:
             echo ""
             echo "==> Processing release: $TAG ($NAME)"
 
-            # Skip if this release already exists on GitHub (published or draft)
             if echo "$EXISTING" | grep -qx "$TAG"; then
               echo "    Already exists on GitHub, skipping."
               continue
             fi
 
-            # Download binary assets (links only, not auto-generated sources)
             mkdir -p "assets_${TAG}"
             LINK_COUNT=$(echo "$release" | jq '.assets.links | length')
 
@@ -187,20 +199,14 @@ jobs:
               echo "    No binary assets found for this release."
             fi
 
-            # Write release notes to a temp file
             echo "$DESC" > "notes_${TAG}.md"
-
-            # Build asset file list
             ASSET_FILES=$(find "assets_${TAG}/" -type f | tr '\n' ' ')
 
-            # --latest marks the release as latest in the GitHub UI only.
-            # Only applied to the most recent release.
             LATEST_FLAG=""
             if [ "$TAG" = "$LATEST_TAG" ]; then
               LATEST_FLAG="--latest"
             fi
 
-            # --verify-tag ensures we use the existing tag from the mirror push
             if [ -z "$ASSET_FILES" ]; then
               gh release create "$TAG" \
                 --repo ${{ env.TARGET_REPO }} \
@@ -219,13 +225,9 @@ jobs:
             fi
 
             echo "    Release $TAG created on GitHub."
-
-            # Clean up temp files for this release
             rm -rf "assets_${TAG}" "notes_${TAG}.md"
           done
 
-          # Ensure the latest label is always on the correct release,
-          # even if it already existed and was skipped in the loop above.
           echo "==> Ensuring 'latest' label is on $LATEST_TAG..."
           gh release edit "$LATEST_TAG" \
             --repo ${{ env.TARGET_REPO }} \
